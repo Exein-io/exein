@@ -161,3 +161,4 @@ __Now checking pid 835__ notifies the process 835 was added to the watch-list.
 - Raspberry PI BCM2709 (Raspberry PI 3+ in arm32 mode)
 - Ramips MT7688
 - Olinuxino i.MX233 ARM926J
+- STM32MP157C-DK2

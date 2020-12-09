@@ -14,80 +14,30 @@ limitations under the License.
 ==============================================================================*/
 
 
-//#define DEBUG
+//#define DEBUGME
 #include "include/libmealloc.h"
 
-shared_buffers *sbuff_init(){
-	shared_buffers *b;
-	int i;
-
-	DODEBUG("mealloc.sbuff_init - get shared memory\n");
-	b = (shared_buffers *) mmap(NULL, sizeof(b) , PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	if (b==NULL) return b;
-	DODEBUG("mealloc.sbuff_init - init struct & semaphore\n");
-	sem_init(&b->semaphore, 0, 7);
-
-	sem_getvalue(&b->semaphore, &i);
-	DODEBUG("mealloc.get_sbuff - semaphore from current value %d\n", i);
-
-	b->map=0;
-	b->busy=0;
-	DODEBUG("mealloc.sbuff_init - zeroing %d bytes %p in matrioska @%p \n", BUF_NUM*BUF_SIZE, b->buffzone, b);
-	memset(b->buffzone, 0, BUF_NUM*BUF_SIZE );
-	return b;
-}
-
-void *get_sbuff(shared_buffers *b){
-	int i=0;
-
-	DODEBUG("mealloc.get_sbuff - wait busy entities to release this resource\n");
-	while (b->busy==1);
-	sem_wait(&b->semaphore);
-	b->busy=1;
-	while (i<BUF_NUM) {
-		DODEBUG("mealloc.get_sbuff - iteration %d mask 0x%02x\n", i, (1<<i));
-		if ((b->map & (1<<i))!=(1<<i)) {
-			DODEBUG("mealloc.get_sbuff - fist free is number %d\n", i);
-			b->busy=0;
-			b->map|=(1<<i);
-			return (void *) (((char *) b->buffzone)+(BUF_SIZE*i));
-			}
-		i++;
-		}
-	DODEBUG("mealloc.get_sbuff - no fee found :(\n");
-	b->busy=0;
-	return NULL;
-}
-
-void rel_sbuf(shared_buffers *b, void *addr){
-	DODEBUG("mealloc.rel_sbuf - request to release buffer.given data is  b=%p and addr=%p.  buffsize=%x (int) ( addr - ((void *) (b->buffzone)) )=%x\n",  b, addr, BUF_SIZE, (int) ( addr - ((void *) (b->buffzone)) ));
-	int i= (int) ( addr - ((void *) (b->buffzone)) ) / BUF_SIZE;
-	DODEBUG("mealloc.rel_sbuf - request to release buffer number %d. Calculated mask is 0x%02x\n", i, ~(1<<i));
-	b->map&=(~(1<<i));
-	sem_post(&b->semaphore);
-}
-
-void sbuff_destroy(shared_buffers *b){
-	 munmap(b, sizeof(b));
-
-}
-
-void *mealloc_init(uint32_t reserved, uint32_t generic_element_size){
+void *mealloc_init(uint32_t reserved, uint32_t generic_element_size, uint8_t color){
 	void *tmp;
 
-	DODEBUG("mealloc.mealloc_init - arguments: reserved=%d, generic_element_size=%d\n", reserved, generic_element_size );
-	DODEBUG("mealloc.mealloc_init - mmap for %ld of shared memory\n", SHM_SIZE(reserved, generic_element_size, CELLS_NUMBER ));
-	tmp = mmap(NULL, SHM_SIZE(reserved, generic_element_size, CELLS_NUMBER ), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-	DODEBUG("mealloc.mealloc_init - Zeroing %ld bytes @%p \n", SHM_SIZE(reserved, generic_element_size, CELLS_NUMBER ), tmp);
-	memset(tmp, 0, SHM_SIZE(reserved, generic_element_size, CELLS_NUMBER ) );
+	DODEBUGME("mealloc.mealloc_init[%d] - arguments: reserved=%d, generic_element_size=%d\n", getpid(), reserved, generic_element_size );
+	DODEBUGME("mealloc.mealloc_init[%d] - mmap for %ld of shared memory\n", getpid(), SHM_SIZE(reserved, generic_element_size, MEALLOC_CELLS_NUMBER ));
+	tmp = mmap(NULL, SHM_SIZE(reserved, generic_element_size, MEALLOC_CELLS_NUMBER ), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	DODEBUGME("mealloc.mealloc_init[%d] - Zeroing %ld bytes @%p \n", getpid(), SHM_SIZE(reserved, generic_element_size, MEALLOC_CELLS_NUMBER ), tmp);
+	memset(tmp, color, SHM_SIZE(reserved, generic_element_size, MEALLOC_CELLS_NUMBER ) );
 	((meallocator *)tmp)->generic_element_size=generic_element_size;
 	((meallocator *)tmp)->reserved=reserved;
+	if (sem_init(&(((meallocator *)tmp)->semaphore), 1, 1)==-1) {
+		printf("mealloc.mealloc_init[%d] - semaphore initialization error\n",  getpid());
+		exit(-1);
+		}
 	return tmp;
 }
 
 void mealloc_destroy(void *shm){
-	DODEBUG("mealloc.mealloc_destroy - shared memory @%p is no more\n", shm );
-	munmap(shm, SHM_SIZE(((meallocator *)shm)->reserved, ((meallocator *)shm)->generic_element_size, CELLS_NUMBER ));
+	DODEBUGME("mealloc.mealloc_destroy[%d] - shared memory @%p is no more\n", getpid(), shm );
+	sem_destroy(&(((meallocator *)shm))->semaphore);
+	munmap(shm, SHM_SIZE(((meallocator *)shm)->reserved, ((meallocator *)shm)->generic_element_size, MEALLOC_CELLS_NUMBER ));
 }
 void *get_reserved_addr(void *shm){
 	return ((void *)((char *) shm)+ sizeof(meallocator) );
@@ -96,41 +46,112 @@ void *get_reserved_addr(void *shm){
 void *mealloc(void *shm){
 	int i;
 
-	DODEBUG("mealloc.mealloc - find first free element\n");
-	for (i=0; i<CELLS_NUMBER; i++) {
-		DODEBUG("mealloc.mealloc - consider %d\n", i );
+	DODEBUGME("mealloc.mealloc[%d] - shm=%p\n", shm);
+	sem_wait(&(((meallocator *)shm)->semaphore));
+	DODEBUGME("mealloc.mealloc[%d] - find first free element\n", getpid());
+	for (i=0; i<MEALLOC_CELLS_NUMBER; i++) {
+		DODEBUGME("mealloc.mealloc[%d] - consider %d\n", getpid(), i );
 		if (c_isfree(shm, i)==ISFREE) {
-			DODEBUG("mealloc.mealloc - found element %d is free\n", i );
 			c_occupy(shm, i);
+			DODEBUGME("mealloc.mealloc[%d] - found element %d is free @%p\n", getpid(), i, ((void *)((char *) shm)+ SHM_NTH_EL_ADDR(((meallocator *)shm)->reserved, ((meallocator *)shm)->generic_element_size, i)) );
+			sem_post(&(((meallocator *)shm)->semaphore));
 			return ((void *)((char *) shm)+ SHM_NTH_EL_ADDR(((meallocator *)shm)->reserved, ((meallocator *)shm)->generic_element_size, i));
 			}
 		}
+	printf("mealloc.mealloc[%d] - Failed to allocate! <<<WARNING>>>\n", getpid());
+	sem_post(&(((meallocator *)shm)->semaphore));
 	return NULL;
 }
 
-void mefree(meallocator *shm, void *addr){
-	DODEBUG("mealloc.mefree - request to free addr@%p, base@%p\n", shm, addr);
+void mefree(meallocator *shm, void *addr, uint8_t color){
+	int	tmp;
+
+	DODEBUGME("mealloc.mefree[%d] - shm=%p, addr=%p, color=%d\n", getpid(),shm, addr, color);
+	sem_wait(&(shm->semaphore));
+	DODEBUGME("mealloc.mefree[%d] - request to free addr@%p, base@%p\n", getpid(), addr, shm);
 	c_free(shm, addr);
-	DODEBUG("mealloc.mefree - erase content\n");
-	memset(addr, 0, shm->generic_element_size);
+	DODEBUGME("mealloc.mefree[%d] - erase content @%p\n", getpid(), addr);
+	memset(addr, color, shm->generic_element_size);
+	sem_post(&(shm->semaphore));
 }
 
 void c_free(meallocator *shm, void *addr){
-	DODEBUG("mealloc.c_free - request to free addr@%p, base@%p\n", shm, addr);
+	DODEBUGME("mealloc.c_free[%d] - request to free addr@%p, base@%p\n", getpid(), addr, shm);
 	int pos=(((int) ( ((char *) addr)-((char *) shm))) - sizeof(meallocator) - shm->reserved)/shm->generic_element_size;
-	DODEBUG("mealloc.c_free - element is number %d\n", pos);
-	shm->map[pos>>5] &= !(1 << (pos &0x1f));
+	DODEBUGME  ("mealloc.c_free[%d] - pos=%d, shm->map[%d]=0x%08x, &masked with 0x%08x\n", getpid(), pos, pos>>5, shm->map[pos>>5], ~(1 << (pos &0x1f)) );
+	shm->map[pos>>5] &= ~(1 << (pos &0x1f));
 }
 
 int c_isfree(meallocator *shm, int pos){
-	DODEBUG("mealloc.c_isfree - request to check element %d, element is in %d uint32\n", pos, pos>>5);
-	DODEBUG("mealloc.c_isfree - shm->map[%d]=0x%08x, masked with 0x%08x\n", pos>>5, shm->map[pos>>5], (1 << (pos &0x1f)));
-	DODEBUG("mealloc.c_isfree - isfree test (0x%08x & 0x%08x )=0x%08x\n", shm->map[pos>>5], (1 << (pos &0x1f)), (shm->map[pos>>5] & (1 << (pos &0x1f))) );
+	DODEBUGME("mealloc.c_isfree[%d] - request to check element %d, element is in %d uint32\n", getpid(), pos, pos>>5);
+	DODEBUGME("mealloc.c_isfree[%d] - shm->map[%d]=0x%08x, &masked with 0x%08x\n", getpid(), pos>>5, shm->map[pos>>5], (1 << (pos &0x1f)));
+	DODEBUGME("mealloc.c_isfree[%d] - isfree test (0x%08x & 0x%08x )=0x%08x\n", getpid(), shm->map[pos>>5], (1 << (pos &0x1f)), (shm->map[pos>>5] & (1 << (pos &0x1f))) );
 	return ((shm->map[pos>>5] & (1 << (pos &0x1f)))!=0)?ISBUSY:ISFREE;
 }
 
 void c_occupy(meallocator *shm, int pos){
-	DODEBUG("mealloc.c_occupy - request to reserve element %d, element is in %d uint32\n", pos, pos>>5);
-	DODEBUG("mealloc.c_occupy - shm->map[%d]=0x%08x, masked with 0x%08x\n", pos>>5, shm->map[pos>>5], (1 << (pos &0x1f)));
+	DODEBUGME("mealloc.c_occupy[%d] - request to reserve element %d, element is in %d uint32\n", getpid(), pos, pos>>5);
+	DODEBUGME("mealloc.c_occupy[%d] - shm->map[%d]=0x%08x, masked with 0x%08x\n", getpid(), pos>>5, shm->map[pos>>5], (1 << (pos &0x1f)));
 	shm->map[pos>>5] |= (1 << (pos &0x1f)) ;
+}
+
+// HASH_BLOOM UT_hash_table UT_hash_bucket                     offset interaction
+//+----------+-------------+--------------------------------+
+//|          |             |#                               |   0x00	0
+//|          |             | ##                             |   0x01	1
+//|          |             |####                            |   0x00	2
+//|          |             |    ########                    |   0x04	3
+//|          |             |################                |   0x00	4
+//|          |             |                ################|   0x10	5
+//|          |             |################################|   0x00	6
+//+----------+-------------+--------------------------------+
+//                          0123456789abcdef0123456789abcdef
+// this implementation assumes the bucket number to grow up to 32 times.
+// it also assumes, as for current uthash implementation, that bucket_num doubles each time it expands
+// given the previous assumption, strategy is to allocate staticaly a shared buffer with size sizeof(gmeallocator)+bloom_reserved_size+table_reserved_size+initial_bucket_size*MULTIPLIER
+
+void *gmealloc_init(int bloom_reserved_size, int table_reserved_size, int initial_bucket_size, int multiplier){
+	gmeallocator *b=NULL;
+
+	DODEBUGME("bloom_reserved_size=%d, table_reserved_size=%d, initial_bucket_size=%d,  multiplier=%d\n", bloom_reserved_size, table_reserved_size, initial_bucket_size, multiplier);
+	switch (multiplier) {
+		case MEALLOC_UT_BUCKET_NO_GROW:
+		case MEALLOC_UT_BUCKET_SMALL_GROW:
+		case MEALLOC_UT_BUCKET_MEDIUM_GROW:
+		case MEALLOC_UT_BUCKET_NO_MAXIMUM:
+			b = (gmeallocator *) mmap(NULL, sizeof(gmeallocator)+bloom_reserved_size+table_reserved_size+initial_bucket_size*multiplier , PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+			memset(b,0, sizeof(gmeallocator)+bloom_reserved_size+table_reserved_size+initial_bucket_size*multiplier );
+			b->bloom_reserved = bloom_reserved_size;
+			b->table_reserved = table_reserved_size;
+			b->initial_bucket = initial_bucket_size;
+			b->iteration = 0;
+			break;
+		default:
+			break;
+		}
+	DODEBUGME("bloom_reserved = %d, table_reserved = %d, initial_bucket = %d @0x%p\n", b->bloom_reserved, b->table_reserved, b->initial_bucket, b);
+	return b;
+}
+void *gmealloc(gmeallocator *shm, int size){
+
+	if (size==shm->bloom_reserved) return GMEALLOC2BLOOM(shm);
+	if (size==shm->table_reserved) return GMEALLOC2TABLE(shm);
+	if ((size%shm->initial_bucket)==0) {
+		shm->iteration++;
+		return GMEALLOC2BUCKET(shm);
+		}
+	printf("gmealloc failed on shm=0x%p,  size=%d [bloom_reserved=%d, table_reserved=%d, initial_bucket=%d]\n", shm, size, shm->bloom_reserved, shm->table_reserved, shm->initial_bucket);
+	return NULL;
+}
+static int pow(int base, int exp){
+
+	if (exp==0) return 1;
+	int res=base;
+	while (--exp) res*=base;
+	return res;
+}
+void gmefree(gmeallocator *shm, void *addr){
+
+	shm->iteration--;
+	memset(addr, 0, shm->initial_bucket * ( pow(2, (shm->iteration)) ) );
 }

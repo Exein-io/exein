@@ -1,4 +1,4 @@
-/* Copyright 2020 Exein. All Rights Reserved.
+/* Copyright 2019 Exein. All Rights Reserved.
 
 Licensed under the GNU General Public License, Version 3.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -36,8 +36,11 @@ extern "C" {
 #include <libexnl.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <sys/resource.h>
+#include <execinfo.h>
 }
 
+#define COLOR 0
 //#define DEBUG
 #ifdef DEBUG
 #define DODEBUG( ... ) printf( __VA_ARGS__ ); fflush(stdout);
@@ -45,11 +48,31 @@ extern "C" {
 #define DODEBUG( ... ) do { } while(0)
 #endif
 
+#define STATE_INIT_START                0
+#define STATE_INIT_SIGNAL               1
+#define STATE_INIT_TENSOR               2
+#define STATE_WORKER_START_ITERATION    3
+#define STATE_WORKER_GOING_TO_DIE       4
+#define STATE_WORKER_DATA_FETCHED       5
+#define STATE_WORKER_DATA_PREPARED      6
+#define STATE_WORKER_DATA_GREENLIGHT    7
+#define STATE_WORKER_DATA_COMPUTED      8
+#define STATE_WORKER_PROCESS_KILL       9
+#define STATE_MASTER_IDLE               10
+#define STATE_MASTER_BREEDING           11
+#define STATE_MLE_PLAYER_INIT           12
+#define STATE_MLE_PLAYER_ZEROS_CNTD     13
+#define STATE_MLE_PLAYER_HOOKS_SHAPED   14
+#define STATE_MLE_PLAYER_ONE_SHOT       15
+#define STATE_MLE_PLAYER_PREDICTED      16
+#define STATE_MLE_PLAYER_ERROR_CALC     17
+#define STATE_MLE_PLAYER_ERROR_DONE     18
+
 
 using namespace tflite;
 
 //#define EXEIN_DEBUG
-#define QUEUESIZE 16
+#define PID_STORE_SIZE 1024
 
 #define TFLITE_MINIMAL_CHECK(x)                                  \
     if (!(x)) {                                                  \
@@ -61,16 +84,26 @@ using namespace tflite;
 uint16_t data[EXEIN_BUFFES_SIZE];
 typedef struct {
     int16_t index;
-    pid_t pids[QUEUESIZE];
+    pid_t pids[PID_STORE_SIZE];
 } pidqueue;
 
+typedef struct {
+    int16_t size;
+    pid_t pids[PID_STORE_SIZE];
+} rnd_access_arr;
 
-pidqueue addpid, *terminate;
-std::map<int, xt::xarray<float>> predictions;
-std::map<int, xt::xarray<float>> errors;
-std::map<int, xt::xarray<int>> old_hooks;
-uint16_t pidl4 = 0;
-pid_t tmppid, tmppid2;
+
+pidqueue				addpid;
+rnd_access_arr				*terminate;
+std::map<int, xt::xarray<float>>	predictions;
+std::map<int, xt::xarray<float>>	errors;
+std::map<int, xt::xarray<int>>		old_hooks;
+uint16_t				pidl4 = 0;
+pid_t					tmppid, tmppid2;
+volatile sig_atomic_t			sigchld_f=0;
+exein_shandle				*h;
+int					sample_index, cnt;
+int					__attribute__((used)) state;
 
 
 static void stack_tr() {
@@ -93,10 +126,12 @@ void sigsegv_handler(int sig, siginfo_t *si, void *unused) {
         case SIGSEGV:
             printf("sigsegv_handler - pid %d got SIGSEGV at address: 0x%lx\n", getpid(), (long) si->si_addr);
             stack_tr();
+            signal(sig, SIG_DFL);
+            kill(getpid(), sig);
             exit(-1);
         case SIGCHLD:
             DODEBUG("sigchld_handler - pid %d got SIGCHLD from %d\n", getpid(), si->si_pid);
-            wait(NULL);
+            sigchld_f++;
             break;
         default:
             printf("sigsegv_handler -[%d] Reecived Signal :%d\n",getpid(), sig);
@@ -114,7 +149,28 @@ pid_t dequeue(pidqueue *q, int remove){
 
 void inqueue(pidqueue *q, pid_t p){
     DODEBUG("inqueue: index=%d val=%d\n", q->index, p);
-    if (q->index<QUEUESIZE) q->pids[++q->index]=p;
+    if (q->index<PID_STORE_SIZE) q->pids[++q->index]=p;
+}
+
+int is_in(pid_t p, rnd_access_arr *pid_repo){
+        int index=0, found=0;
+        while((index<PID_STORE_SIZE)&&(found<pid_repo->size)&&(pid_repo->pids[index]!=p)) {
+                if (pid_repo->pids[index]!=0) found++;
+                index++;
+                }
+        if(pid_repo->pids[index]==p){
+                pid_repo->pids[index]=0;
+                pid_repo->size--;
+                return 1;
+                }
+        return 0;
+}
+
+void put_in(pid_t p, rnd_access_arr *pid_repo){
+        int index=0;
+        while((index<PID_STORE_SIZE)&&(pid_repo->pids[index]!=0)) index++;
+        if (index<PID_STORE_SIZE) pid_repo->pids[index]=p;
+        pid_repo->size++;
 }
 
 
@@ -134,6 +190,7 @@ std::vector<int> split(std::string str) {
 
 
 xt::xarray<int> isin(int hid, std::vector<int> item, int val, int notval) {
+
     xt::xarray<int>::shape_type sh0 = {1, item.size()};
     auto res = xt::empty<int>(sh0);
     res.fill(notval);
@@ -271,7 +328,7 @@ mle_player(tflite::Interpreter* interpreter, xt::xarray<int> hook_arr, uint16_t 
            std::map<string, string> model_params, std::map<int, xt::xarray<float>> predictions,
            std::map<int, xt::xarray<float>> errors) {
 
-    int index;
+    state=STATE_MLE_PLAYER_INIT;
     xt::xarray<float> pred;
     DODEBUG("mle_player - begin \n");
     // get meta-parameters from dictionary
@@ -279,43 +336,53 @@ mle_player(tflite::Interpreter* interpreter, xt::xarray<int> hook_arr, uint16_t 
     int window_size = std::stoi(model_params["window_size"]);
     float threshold = std::stof(model_params["threshold"]);
     int rolling_size = std::stoi(model_params["rolling_size"]);
+    int i;
 
-    // turn hook sequence into feature for prediction
-    index = rand()%( ((int)( hook_arr.end()-hook_arr.begin() )) - window_size - 1);
-
-    DODEBUG("mle_player - index seed %d, windowsize=%d, array size=%d\n", index, window_size, hook_arr.end()-hook_arr.begin());
-    std::vector<int> wsize_hook_arr_tmp(hook_arr.begin()+index, hook_arr.begin()+index+window_size);
+   cnt=0;
+   // evaluate zeros at the beginnig
+   for (i=0; i< hook_arr.size(); i++ ){
+       if (hook_arr(i)==COLOR) cnt++;
+          else break;
+          }
+    state=STATE_MLE_PLAYER_ZEROS_CNTD;
+    sample_index=rand()%(  hook_arr.size() - window_size - 1 - cnt);
+    std::vector<int> wsize_hook_arr_tmp(hook_arr.begin()+sample_index+cnt, hook_arr.begin()+sample_index+window_size+cnt);
     std::vector<std::size_t> shape = { 1, window_size };
     auto wsize_hook_arr = xt::adapt(wsize_hook_arr_tmp, shape);
 
+    state=STATE_MLE_PLAYER_HOOKS_SHAPED;
 #ifdef EXEIN_DEBUG
     std::cout << wsize_hook_arr << "\n";
 #endif
+
     xt::xarray<int> x_tmp = isnotin(wsize_hook_arr, hooks, -1);
     xt::xarray<int> x = one_hot(x_tmp, hooks, window_size);
 
+    state=STATE_MLE_PLAYER_ONE_SHOT;
     int output = interpreter->outputs()[0];
     std::vector<int> output_shape = get_tensor_shape(interpreter->tensor(output));
 
     // make prediction and update prediction dict
     pred = make_prediction(interpreter, x, output_shape);
 
+    state=STATE_MLE_PLAYER_PREDICTED;
     predictions[pid] = pred;
 
     // check for signal
     int signal = 0;
     if (xt::mean(predictions[pid])() != 0) {
         xt::xarray<int> onehot_hid;
-        int hid = hook_arr[index + window_size];
+        int hid = hook_arr[sample_index + cnt + window_size];
 
         // turn latest Hook ID into one-hot vecto
         if (std::find(hooks.begin(), hooks.end(), hid) != hooks.end())
             onehot_hid = isin(hid, hooks, 1, 0);
         else
             onehot_hid = isin(-1, hooks, 1, 0);
-
-        // compute cross-ent between predicted and actually observed Hook ID
+        state=STATE_MLE_PLAYER_ERROR_CALC;
         float err = cross_entropy(predictions[pid], onehot_hid);
+        state=STATE_MLE_PLAYER_ERROR_DONE;
+
         if (xt::mean(errors[pid])() != 0) {
             errors[pid] = update_error(errors[pid], err);
         } else {
@@ -340,11 +407,11 @@ mle_player(tflite::Interpreter* interpreter, xt::xarray<int> hook_arr, uint16_t 
 void new_pid_notify_cb(uint16_t pid) { //TODO: fork COW
     inqueue(&addpid, (pid_t) pid);
     printf("Now checking pid %d\n", pid);
+    exein_add_pid(h, pid);
 }
 
-
 void removed_pid_notify_cb(uint16_t pid) {
-    inqueue(terminate, (pid_t) pid);
+    put_in((pid_t) pid, terminate);
     printf("Removing pid %d\n", pid);
 }
 
@@ -367,20 +434,14 @@ int main(int argc, char* argv[]) {
     const char			*model_name = argv[3];
     std::map<string, string>	model_params;
     int				signal_ = 0;
-    exein_shandle		*h;
     struct sigaction		sa = {0};
+    exein_pids *		pid_data=NULL;
 
-
+    state=STATE_INIT_START;
     srand(time(NULL));
-    sigemptyset(&sa.sa_mask);
-    sa.sa_sigaction = sigsegv_handler;
-    sa.sa_flags = SA_SIGINFO;
-    if (sigaction(SIGSEGV, &sa, NULL) == -1) {
-        printf("Receive feeds can't install the signal handler.");
-    }
 
-    terminate = (pidqueue *)  mmap(NULL, 512, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0); //probably it takes 4k, as a linux memory page is defined.
-    terminate->index=-1;
+    terminate = (rnd_access_arr *)  mmap(NULL, sizeof(rnd_access_arr), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0); //probably it takes 4k, as a linux memory page is defined.
+    memset(terminate, 0, sizeof(rnd_access_arr)); //size field is set to 0  by memset
 
     addpid.index=-1;
     model_params = initialize_exein(config_file);
@@ -395,11 +456,14 @@ int main(int argc, char* argv[]) {
         printf("Receive feeds can't install the signal handler.");
     }
 
+signal(SIGCHLD, SIG_IGN);
+
     if (!(h = exein_agent_start(secret, tag))) {
         std::cout << "Can't starting Exein agent" << '\n';
         return 1;
     }
 
+    state=STATE_INIT_SIGNAL;
     DODEBUG("model init\n");
     std::unique_ptr<tflite::FlatBufferModel> model = tflite::FlatBufferModel::BuildFromFile(model_name);
     TFLITE_MINIMAL_CHECK(model != nullptr);
@@ -414,19 +478,29 @@ int main(int argc, char* argv[]) {
     // Allocate tensor buffers.
     TFLITE_MINIMAL_CHECK(interpreter->AllocateTensors() == kTfLiteOk);
     DODEBUG("Tensors done\n");
+    state=STATE_INIT_TENSOR;
     while (true) { //pid specialized processes
-        DODEBUG("MainLoop Itaration pid=%d\n", pidl4);
+        //DODEBUG("MainLoop Itaration pid=%d\n", pidl4);
         if((pidl4!= 0)) {
+            state=STATE_WORKER_START_ITERATION;
             DODEBUG("[T%d-M%d] iteration started| ", pidl4, getpid());
-            if (pidl4==dequeue(terminate,0)) {
-                DODEBUG("[T%d-M%d] have been named. RIP| ", pidl4, getpid());
-                exit(dequeue(terminate,1));
+            if (is_in(pidl4,terminate)) {
+                state=STATE_WORKER_GOING_TO_DIE;
+		if (pid_data) {
+			exein_remove_pid(h,(uint16_t) pidl4);
+			pid_data=NULL;
+			}
+                DODEBUG("[T%d-M%d] have been named. RIP\n", pidl4, getpid());
+                exit(pidl4);
             }
             DODEBUG("[T%d-M%d] is fetching data| ", pidl4, getpid());
-            if (exein_fetch_data(h, pidl4, data) == EXEIN_NOERR) {
+            // here 
+            if (!pid_data) pid_data=exein_find_data(h, pidl4);
+            if ((pid_data)&&(exein_fetch_data(h, pidl4, data, pid_data) == EXEIN_NOERR)) {
+                state=STATE_WORKER_DATA_FETCHED;
                 std::vector<std::size_t> shape = { EXEIN_BUFFES_SIZE };
                 auto input_data = xt::adapt((short unsigned int*)data, EXEIN_BUFFES_SIZE, xt::no_ownership(), shape);
-
+                state=STATE_WORKER_DATA_PREPARED;
                 if (old_hooks.count(pidl4) == 0) {
                     old_hooks[pidl4] = input_data;
                 } else {
@@ -437,11 +511,11 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                int nonzero = EXEIN_BUFFES_SIZE - std::count(input_data.begin(), input_data.end(), 0);
-                if (nonzero < std::stoi(model_params["window_size"])) {
+                int nonzero = EXEIN_BUFFES_SIZE - std::count(input_data.begin(), input_data.end(), COLOR);
+                if (nonzero < std::stoi(model_params["window_size"])+5) {
                     continue;
                 }
-
+                state=STATE_WORKER_DATA_GREENLIGHT;
 #ifdef DEBUG
                 std::cout << "--------------------------------" << "\n";
                 std::cout << pidl4 << " input data: " << input_data << '\n';
@@ -450,25 +524,43 @@ int main(int argc, char* argv[]) {
 
                 std::tie(predictions, errors, signal_) = mle_player(interpreter.get(), input_data, pidl4, model_params, predictions, errors);
 
-#ifdef DEBUG
                 for (auto e: errors) {
                     std::cout << e.first << ": " << e.second << "\n";
                 }
-#endif
 
+                state=STATE_WORKER_DATA_COMPUTED;
                 if (signal_) {
+                    state=STATE_WORKER_PROCESS_KILL;
                     std::cout << "Block process: " << pidl4 << "\n";
+                    for (auto e: errors) {
+                        std::cout << e.first << ": " << e.second << "\n";
+                        }
+                    std::cout << pidl4 << " input data: " << input_data << '\n';
+                    std::cout << sample_index << '\n';
+                    std::cout << cnt << '\n';
+                    std::vector<int> wsize_hook_arr_tmp(input_data.begin()+sample_index+cnt, input_data.begin()+sample_index+10+cnt);
+                    std::vector<std::size_t> shape = { 1, 10 };
+                    auto wsize_hook_arr = xt::adapt(wsize_hook_arr_tmp, shape);
+
+                    std::cout << wsize_hook_arr << '\n';
                     exein_block_process(h, pidl4, secret, tag);
                 }
             } else {
                 DODEBUG("[T%d-M%d] fetch_data timeout\n", pidl4, getpid() );
 	    }
         } else {// Master process
+            state=STATE_MASTER_IDLE;
             usleep(300);
+            state=STATE_MASTER_BREEDING;
+	    if (sigchld_f>0) {
+		wait(NULL);
+		sigchld_f--;
+		}
             if ((tmppid=dequeue(&addpid,1))!=0) {
                 if ((tmppid2=fork())==0) {
-                    DODEBUG("\nNew pid appeared = [T%d-M%d] \n", tmppid2, tmppid);
                     pidl4=tmppid;
+                } else {
+                    printf("\nNew pid appeared = [T%d-M%d] \n", tmppid, tmppid2);
                 }
             }
         }

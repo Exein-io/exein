@@ -46,41 +46,44 @@ limitations under the License.
 #include "libmealloc.h"
 
 /*errors*/
-#define EXEIN_NOERR		0
-#define EXEIN_ERR_NLSOCKET	-1
-#define EXEIN_ERR_NLBIND	-2
-#define EXEIN_ERR_NOMEM		-3
-#define EXEIN_ERR_NLCOM		-4
-#define EXEIN_ERR_REGISTER	-5
-#define EXEIN_ERR_NOPID		-6
-#define EXEIN_CANARYERR		-7
-#define EXEIN_ERR_CLOCKFAILURE	-8
-#define EXEIN_ERR_TIMEOUT	-9
+#define EXEIN_NOERR			0
+#define EXEIN_ERR_NLSOCKET		-1
+#define EXEIN_ERR_NLBIND		-2
+#define EXEIN_ERR_NOMEM			-3
+#define EXEIN_ERR_NLCOM			-4
+#define EXEIN_ERR_REGISTER		-5
+#define EXEIN_ERR_NOPID			-6
+#define EXEIN_CANARYERR			-7
+#define EXEIN_ERR_CLOCKFAILURE		-8
+#define EXEIN_ERR_TIMEOUT		-9
+#define EXEIN_ERR_PTR_INV		-10
+#define EXEIN_ERR_NO_NEED_TO_WORRY	-11
 
-#define EXEIN_MSG_REG		1
-#define EXEIN_MSG_KA		2
-#define EXEIN_MSG_FEED		3
-#define EXEIN_MSG_BK 		4
-#define EXEIN_MSG_DATA_RQ	5
-#define EXEIN_MSG_NEW_PID	6
-#define EXEIN_MSG_DEL_PID       7
+#define EXEIN_MSG_REG			1
+#define EXEIN_MSG_KA			2
+#define EXEIN_MSG_FEED			3
+#define EXEIN_MSG_BK 			4
+#define EXEIN_MSG_DATA_RQ		5
+#define EXEIN_MSG_NEW_PID		6
+#define EXEIN_MSG_DEL_PID		7
+#define EXEIN_STAT_SK_ENOMEM		3
+#define EXEIN_STAT_RF_ENOMEM		4
+#define EXEIN_STAT_RF_ENLCOM		6
+#define EXEIN_STAT_OK			0
 
-#define EXEIN_STAT_SK_ENOMEM	3
-#define EXEIN_STAT_RF_ENOMEM	4
-#define EXEIN_STAT_RF_ENLCOM	6
-#define EXEIN_STAT_OK		0
+#define EXEIN_DONT_TOUCH		1
+#define EXEIN_CAN_BE_REMOVED		0
 
-#define EXEIN_SK_STACK_SIZE	4*1024
-#define EXEIN_RF_STACK_SIZE	8*1024
+#define EXEIN_SK_STACK_SIZE		4*1024
+#define EXEIN_RF_STACK_SIZE		8*1024
 
-#define EXEIN_RCV_PKTS		256
-#define EXEIN_PKT_SIZE		NLMSG_SPACE(80)
+#define EXEIN_RCV_PKTS			256
+#define EXEIN_PKT_SIZE			NLMSG_SPACE(EXEIN_BUFFES_SIZE*2+20)
 
-#define EXEIN_TIMEOUT_SEC	5
-#define EXEIN_TIMEOUT_NSEC	0
-#define EXEIN_FD_TIMEOUT_SEC	1
-#define EXEIN_FD_TIMEOUT_NSEC	0
-
+#define EXEIN_TIMEOUT_SEC		5
+#define EXEIN_TIMEOUT_NSEC		0
+#define EXEIN_FD_TIMEOUT_SEC		0
+#define EXEIN_FD_TIMEOUT_NSEC		300000000
 
 #ifndef DODEBUG
 #ifdef DEBUG
@@ -90,13 +93,9 @@ limitations under the License.
 #endif
 #endif
 
-
-
-/**/
-
-#define EXEIN_BUFFER_MASK 0x1f
-#define EXEIN_BUFFES_SIZE 0x20
-#define EXEIN_BUFFES_SIZE_CNT 0x05
+#define EXEIN_BUFFER_MASK 0x7f
+#define EXEIN_BUFFES_SIZE 0x80 // make sure this size corresponds to the kernel ringbuffer size
+#define EXEIN_BUFFES_SIZE_CNT 0x07
 
 #define EXEIN_BACKTRACE_SIZE 20
 #define NETLINK_USER 31
@@ -108,6 +107,7 @@ typedef struct {
 	UT_hash_handle		hh;
 	uint16_t		pid;
 	sem_t			semaphore;
+	int			safe2remove;
 	uint16_t		*buffer;
 } exein_pids;
 
@@ -118,12 +118,13 @@ typedef struct {
 	struct nlmsghdr		*nlh_rf, *nlh_sk;
 	struct msghdr		*msg_sk, *msg_rf;
 	exein_pids		*pids;
+	sem_t			pids_lock __attribute__ ((aligned (8)));
 	int			sock_fd;
 	void			*sk_stack, *rf_stack;
 	pid_t			sk_pid, rf_pid, cpid;
 	int			trouble;
-	shared_buffers		*buffers_pool;
-	void			*hash_shm;
+	void			*buffers_pool;
+	void			*uthash_shm;
 } exein_shandle;
 
 typedef struct {
@@ -148,25 +149,26 @@ typedef struct {
         uint16_t		payload[EXEIN_BUFFES_SIZE];
 } exein_prot_reply_t;
 
-void* salloc(size_t size);
-extern void (*exein_new_pid_notify_cb)(uint16_t);
-extern void (*exein_delete_pid_cb)(uint16_t);
+void*		salloc				(size_t size);
+extern void	(*exein_new_pid_notify_cb)	(uint16_t);
+extern void	(*exein_delete_pid_cb)		(uint16_t);
 
 exein_prot_req_t        keepalive,registration;
 
 /* aux funtions */
-void exein_print_version();
-void exein_dummy_pid_notify_cb(uint16_t pid);
-void exein_dummy_pid_delete_cb(uint16_t pid);
+void 		exein_print_version();
+void		exein_dummy_pid_notify_cb	(uint16_t pid);
+void		exein_dummy_pid_delete_cb	(uint16_t pid);
 
 
 /* interface functions */
-int exein_remove_pid(exein_shandle *uhandle, uint16_t pid);
-int exein_fetch_data(exein_shandle *uhandle, uint16_t pid, uint16_t *dstbuf);
-void exein_agent_stop(exein_shandle *uhandle);
-exein_shandle *exein_agent_start(uint32_t key, uint16_t tag);
-int exein_block_process(exein_shandle *uhandle, uint16_t pid, uint32_t key, uint16_t tag);
-
-int exein_register_callback_signal(int signum, void (*call)(int signum, siginfo_t *si, void *ct));
+int		exein_remove_pid		(exein_shandle *uhandle, uint16_t pid);
+int		exein_fetch_data		(exein_shandle *uhandle, uint16_t pid, uint16_t *dstbuf, exein_pids *pid_data);
+void		exein_agent_stop		(exein_shandle *uhandle);
+exein_shandle	*exein_agent_start		(uint32_t key, uint16_t tag);
+int		exein_block_process		(exein_shandle *uhandle, uint16_t pid, uint32_t key, uint16_t tag);
+int		exein_add_pid			(exein_shandle *uhandle, uint16_t pid);
+int		exein_register_callback_signal	(int signum, void (*call)(int signum, siginfo_t *si, void *ct));
+exein_pids 	*exein_find_data		(exein_shandle *uhandle, uint16_t pid);
 
 #endif
