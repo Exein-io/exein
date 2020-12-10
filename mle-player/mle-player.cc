@@ -532,17 +532,6 @@ signal(SIGCHLD, SIG_IGN);
                 if (signal_) {
                     state=STATE_WORKER_PROCESS_KILL;
                     std::cout << "Block process: " << pidl4 << "\n";
-                    for (auto e: errors) {
-                        std::cout << e.first << ": " << e.second << "\n";
-                        }
-                    std::cout << pidl4 << " input data: " << input_data << '\n';
-                    std::cout << sample_index << '\n';
-                    std::cout << cnt << '\n';
-                    std::vector<int> wsize_hook_arr_tmp(input_data.begin()+sample_index+cnt, input_data.begin()+sample_index+10+cnt);
-                    std::vector<std::size_t> shape = { 1, 10 };
-                    auto wsize_hook_arr = xt::adapt(wsize_hook_arr_tmp, shape);
-
-                    std::cout << wsize_hook_arr << '\n';
                     exein_block_process(h, pidl4, secret, tag);
                 }
             } else {
