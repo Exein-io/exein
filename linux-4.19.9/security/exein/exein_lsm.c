@@ -38,10 +38,14 @@
 
 
 #define NN_DEBUG 1
-#define CURRENT_PROCESS_FEATURES 1 // Took as a duplicate from exein_struct_mappings.c as a temporal solution
-#undef EXEIN_FS_CONTEXT_PARSE_PARAM_SWITCH   //this hook, newly implemented, generates some issues / not available on 4.14.151
-#undef EXEIN_FS_CONTEXT_DUP_SWITCH           //not available on 4.14.151
+#define CURRENT_PROCESS_FEATURES 1 		// Took as a duplicate from exein_struct_mappings.c as a temporal solution
+#undef EXEIN_FS_CONTEXT_PARSE_PARAM_SWITCH	//this hook, newly implemented, generates some issues / not available on 4.14.151
+#undef EXEIN_FS_CONTEXT_DUP_SWITCH		//not available on 4.14.151
 #undef EXEIN_INODE_GETSECURITY_SWITCH
+
+//#ifdef CONFIG_DUP_TS_FIND_IN_LSM
+//extern int do_dup_td_find(int hook);
+//#endif
 
 //int	exein_debug=0;
 int	exein_mode=EXEIN_ONREQUEST;
@@ -53,8 +57,8 @@ struct	sock *exein_nl_sk_lsm=NULL;
 DEFINE_SPINLOCK(exein_pid_data_access);
 DEFINE_SPINLOCK(exein_reg_data_access);
 
-DEFINE_HASHTABLE(nl_peers,5);
-DEFINE_HASHTABLE(pid_repo,5);
+DEFINE_HASHTABLE(nl_peers,HASHTABLE_BITS);
+DEFINE_HASHTABLE(pid_repo,HASHTABLE_BITS);
 
 //EXPORT_SYMBOL(exein_debug);
 EXPORT_SYMBOL(exein_mode);
@@ -69,9 +73,13 @@ int exein_rndkey=SEEDRND;
 	EXPORT_SYMBOL(exein_rndkey);
 #endif
 
-static int hash_func(u16 data)
+static int hash_func_4_addrs(PTRSIZE data)
+{ //because the allignment, and other stuffs there's more entrophy starting from bit 5
+    return (data >> 6) & ((1<<HASHTABLE_BITS)-1);
+}
+static int hash_func_4_pids(int data)
 {
-    return data & 0x7f;
+    return data & ((1<<HASHTABLE_BITS)-1);
 }
 
 // this function gets called after a grace period has elapsed to deallocate the unlinked exein_pid_data elements.
@@ -109,11 +117,11 @@ int exein_pid_status_get(char *buf, int size){ // TODO: Replace sprintf with snp
 	exein_reg_data *reg_data;
 	exein_pid_data *pid_data;
 
-	pos+=sprintf( (buf+pos),"pid, tag, peer_pid\n");
+	pos+=sprintf( (buf+pos),"pid, tag, ts_addr, peer_pid\n");
 	rcu_read_lock();
 	hash_for_each(pid_repo, pid_cursor, pid_data, next){
 		hash_for_each(nl_peers, bkt_cursor, reg_data, next) if (reg_data->tag==pid_data->tag) peerpid=reg_data->pid;
-		pos+=sprintf( (buf+pos),"%d,%d,%d\n", pid_data->pid, pid_data->tag, peerpid);
+		pos+=sprintf( (buf+pos),"%d,%d,%x,%d\n", pid_data->pid, pid_data->tag, pid_data->task_struct_addr, peerpid);
 		}
 	rcu_read_unlock();
 	return pos;
@@ -233,7 +241,7 @@ static int exein_payload_process(void *data, pid_t pid){
 			reg_data->timestamp=jiffies_64;
 			reg_data->seqn=0;
 			spin_lock_bh(&exein_reg_data_access);
-			hash_add_rcu(nl_peers, &reg_data->next, reg_data->pid);
+			hash_add_rcu(nl_peers, &reg_data->next, hash_func_4_pids(reg_data->pid) );
 			spin_unlock_bh(&exein_reg_data_access);
 #ifdef EXEIN_PRINT_DEBUG
 			rcu_read_lock();
@@ -244,7 +252,7 @@ static int exein_payload_process(void *data, pid_t pid){
 			break;
 		case EXEIN_PROT_KEEPALIVE_ID: //in this section, the "curr_data->timestamp" is actually written, but considering that modern processors are able to write int64 atomically, this should not concur with any race.
 			rcu_read_lock();
-			hash_for_each_possible(nl_peers, curr_data, next, pid) {
+			hash_for_each_possible(nl_peers, curr_data, next, hash_func_4_pids(pid) ) {
 				if ((curr_data->tag==((exein_prot_req_t *)data)->tag)){
 					curr_data->timestamp=jiffies_64;
 					DODEBUG(KERN_INFO "ExeinLSM - MLE (PID %d) for tag [%d] registration updated\n", pid, ((exein_prot_req_t *)data)->tag);
@@ -304,7 +312,7 @@ static void commit_data(exein_feature_t *data, int size, uint16_t *NNInput){
 					if ((data[EXEIN_PROT_TAG_POS]==reg_data->tag)) {
 						reg_found=1;
 						hash_for_each_rcu(pid_repo, pid_cursor, pid_data, next){	// look at the PIDs we have, if found update the ring buffer
-							if (data[2]==pid_data->pid){				//check if current is hash item corresponds to the target
+							if (CURRENT_ADDR==pid_data->task_struct_addr){		//check if current is hash item corresponds to the target
 								pid_found=1;
 								break;
 								}
@@ -320,7 +328,7 @@ static void commit_data(exein_feature_t *data, int size, uint16_t *NNInput){
 							return;
 							}
 						data[EXEIN_PROT_TAG_POS]=NNInput[EXEIN_HOOK_ID_ARG1_POS];
-						spin_lock_bh(&pid_data->ring_buffer_lock);
+						spin_lock_bh(&pid_data->ring_buffer_lock); //TODO: verifythe short period between the rcu_read_unlock and the spinlock do ot generates races
 						pid_data->in_use=1;
 						pid_data->index++;
 						pid_data->index&=0x7f;
@@ -359,6 +367,7 @@ static void commit_data(exein_feature_t *data, int size, uint16_t *NNInput){
 							pid_data->pid=data[2];
 							pid_data->tag=reg_data->tag;
 							pid_data->index=0;
+							pid_data->task_struct_addr= CURRENT_ADDR;
 							pid_data->in_use=1;
 							spin_lock_init(&pid_data->ring_buffer_lock);
 							for (i=0; i<EXEIN_RINGBUFFER_SIZE; i++) { //allocate all buffers
@@ -369,9 +378,9 @@ static void commit_data(exein_feature_t *data, int size, uint16_t *NNInput){
 							memcpy(pid_data->hookdata[0], data, size*sizeof(exein_feature_t));//TODO:Does not check for buffer overflows when copying to destination (CWE-120). Make sure destination can always hold the source data.
 
 							spin_lock_bh(&exein_pid_data_access);
-							hash_add_rcu(pid_repo, &pid_data->next, pid_data->pid);
+							hash_add_rcu(pid_repo, &pid_data->next, hash_func_4_addrs(pid_data->task_struct_addr) );
 							spin_unlock_bh(&exein_pid_data_access);
-							printk(KERN_INFO "ExeinLSM[TS=%llu] - pid[%d] just spawned! hookpid_data@0x%p hookNo=%d\n", jiffies_64, current->pid, pid_data, NNInput[EXEIN_HOOK_ID_ARG1_POS]);
+							DODEBUG(KERN_INFO "ExeinLSM[TS=%llu] - pid[%d] just spawned! hookpid_data@0x%p hookNo=%d\n", jiffies_64, current->pid, pid_data, NNInput[EXEIN_HOOK_ID_ARG1_POS]);
 							msg_rpy.msg_type = EXEIN_PROT_NEW_PID;
 							msg_rpy.seed = SEEDRND;
 							msg_rpy.seq=(u16) reg_data->seqn++;
@@ -400,6 +409,9 @@ static void commit_data(exein_feature_t *data, int size, uint16_t *NNInput){
 				printk(KERN_ERR "ExeinLSM - LSM is working in an unknown mode!\n");
 			}
 		}
+//#ifdef CONFIG_DUP_TS_FIND_IN_LSM
+//	do_dup_td_find(NNInput[EXEIN_HOOK_ID_ARG1_POS]);
+//#endif
 }
 
 static void exein_prepare_send_data(size_t start_index, size_t end_index, uint16_t *NNInput){
@@ -431,11 +443,11 @@ void exein_delete_pids(void){ //this function is called inside /kernel/exit.c:do
 	exein_reg_data		*reg_data;
 	exein_prot_reply	msg_rpy;
 
-	DODEBUG(KERN_INFO "ExeinLSM[TS=%llu] - exein_delete_pids: delete pid_data [%d]\n", jiffies_64, current->pid);
+	DODEBUG(KERN_INFO "ExeinLSM[TS=%llu] - exein_delete_pids: delete pid_data [%d] l4 %x(%d)\n", jiffies_64, current->pid, CURRENT_ADDR, sizeof(CURRENT_ADDR) );
 	if ((exein_mode==EXEIN_ONREQUEST)&&(current->process_tag!=0)){
 		rcu_read_lock();
-		hash_for_each_possible_rcu(pid_repo, pid_data, next, current->pid){ // look at the PIDs we have, if found update the ring buffer
-			if (current->pid==pid_data->pid){
+		hash_for_each_possible_rcu(pid_repo, pid_data, next, hash_func_4_addrs(CURRENT_ADDR) ){ // look at the PIDs we have, if found update the ring buffer
+			if (CURRENT_ADDR==pid_data->task_struct_addr){
 				hash_for_each_rcu(nl_peers, bkt_cursor, reg_data, next){
 					if (pid_data->tag==reg_data->tag) {
 						DODEBUG(KERN_INFO "ExeinLSM[TS=%llu] - exein_delete_pids: PID[%d] found @0x%p owned by %d at 0x%p\n", jiffies_64, current->pid, pid_data, reg_data->pid, reg_data);
@@ -447,7 +459,7 @@ void exein_delete_pids(void){ //this function is called inside /kernel/exit.c:do
 			}
 		rcu_read_unlock();
 		if ( pid_data && reg_data){
-			DODEBUG(KERN_INFO "ExeinLSM - pid=%d is no more. Send a message back to tell it\n",current->pid);
+			DODEBUG(KERN_INFO "ExeinLSM - pid=%d is no more. Send a message back to tell it pid_data=%px, reg_data=%px\n",current->pid, pid_data, reg_data);
 			pid_data->in_use=1;
 			msg_rpy.msg_type = EXEIN_PROT_DEL_PID;
 			msg_rpy.seed = SEEDRND;
@@ -905,6 +917,7 @@ static int exein_inode_alloc_security(struct inode *inode )
 #ifdef EXEIN_PRINT_DEBUG
 #endif
     NNInput[EXEIN_HOOK_ID_ARG1_POS] = EXEIN_INODE_ALLOC_SECURITY_ID;
+//    printk(KERN_INFO "EXEIN_INODE_ALLOC_SECURITY hookid=%d, pid=%d\n", NNInput[EXEIN_HOOK_ID_ARG1_POS], NNInput[EXEIN_HOOK_CURRENT_PROCESS_ARG1_POS]);
     exein_map_current_to_features(NNInput);
     size_t arg1_pos = EXEIN_INODE_ALLOC_SECURITY_ARG1_POS;
     size_t feature_index = 3;

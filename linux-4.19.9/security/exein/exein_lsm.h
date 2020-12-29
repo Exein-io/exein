@@ -13,6 +13,7 @@
 #define EXEIN_NN_MAX_SIZE		50
 #define EXEIN_RINGBUFFER_SIZE		(1<<7)
 #define EXEIN_FEATURE_NUM_MAX		35
+#define HASHTABLE_BITS			5
 
 #define EXEIN_ONREQUEST			0x80
 #define EXEIN_LIVE			0x81
@@ -23,7 +24,13 @@
 #define DODEBUG( ... ) do { } while(0)
 #endif
 
-
+#ifdef __LP64__
+#define CURRENT_ADDR ((u64) current)
+#define PTRSIZE u64
+#else
+#define CURRENT_ADDR ((u32) current)
+#define PTRSIZE u32
+#endif
 
 typedef struct {
         u32			key;
@@ -51,6 +58,11 @@ typedef struct {
 
 typedef struct {
 	pid_t			pid;
+#ifdef __LP64__
+	u64			task_struct_addr;
+#else
+	u32			task_struct_addr;
+#endif
 	u16			tag;
 	exein_pid_data_cell	*hookdata[EXEIN_RINGBUFFER_SIZE];
 	spinlock_t 		ring_buffer_lock;
